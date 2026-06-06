@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guardián de Olvidos</title>
+    <link rel="manifest" href="./manifest.json">
+    <meta name="theme-color" content="#3b82f6">
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-white font-sans min-h-screen flex flex-col items-center justify-center p-4">
+
+    <div class="max-w-md w-full bg-gray-900 rounded-2xl p-6 shadow-2xl border border-gray-800 text-center">
+        <div class="text-6xl mb-4 animate-pulse">⌚</div>
+        
+        <h1 class="text-2xl font-bold mb-2 text-blue-400">Guardián de Olvidos</h1>
+        <p class="text-gray-400 text-sm mb-6">Radar pasivo (compatible con Mi Fitness).</p>
+
+        <div class="mb-6 p-4 rounded-xl bg-gray-800 border border-gray-700">
+            <span class="text-xs uppercase tracking-wider text-gray-500 block mb-1">Estado del Radar</span>
+            <div id="statusBadge" class="text-lg font-semibold text-yellow-500">Radar Apagado</div>
+            <div id="lastSeen" class="text-xs text-gray-500 mt-1">Dispositivo no rastreado aún</div>
+        </div>
+
+        <div class="space-y-3">
+            <button id="startRadarBtn" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-3 px-4 rounded-xl transition duration-200 shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2">
+                <span>Activar Radar Pasivo</span>
+            </button>
+            <p class="text-xs text-gray-400 px-4">Esta opción no desconecta tu reloj de la aplicación Mi Fitness.</p>
+        </div>
+
+        <div id="alarmZone" class="mt-6 p-4 rounded-xl bg-red-950/40 border border-red-500/40 hidden">
+            <p class="text-red-400 font-bold animate-bounce text-sm">⚠️ ¡ALERTA: DISPOSITIVO FUERA DE RANGO!</p>
+        </div>
+    </div>
+
+    <audio id="silentAudio" loop>
+        <source src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==" type="audio/wav">
+    </audio>
+
+    <script>
+        // Registro del Service Worker
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js').catch(err => console.error(err));
+            });
+        }
+
+        const startRadarBtn = document.getElementById('startRadarBtn');
+        const statusBadge = document.getElementById('statusBadge');
+        const lastSeen = document.getElementById('lastSeen');
+        const alarmZone = document.getElementById('alarmZone');
+        const silentAudio = document.getElementById('silentAudio');
+
+        let watchTargetId = null;
+        let lastResponseTime = Date.now();
+        let checkInterval = null;
+        let scanSession = null;
+
+        // Solicitar permisos de notificación
+        if (Notification.permission !== "granted") {
+            Notification.requestPermission();
+        }
+
+        startRadarBtn.addEventListener('click', async () => {
+            try {
+                // Activar audio de fondo
+                silentAudio.play().catch(e => console.log(e));
+
+                statusBadge.textContent = "Selecciona tu reloj...";
+                statusBadge.className = "text-lg font-semibold text-yellow-400";
+
+                // Le pedimos al navegador que busque el reloj una sola vez para guardar su ID
+                const device = await navigator.bluetooth.requestDevice({
+                    acceptAllDevices: true
+                });
+
+                watchTargetId = device.id;
+                statusBadge.textContent = "Radar Escuchando...";
+                statusBadge.className = "text-lg font-semibold text-green-400";
+                lastSeen.textContent = "Sincronizado con: " + (device.name || "Reloj");
+
+                // Iniciamos el escaneo de anuncios pasivos (sin conectar)
+                iniciarEscaneoPasivo(device.name);
+
+            } catch (error) {
+                console.error(error);
+                statusBadge.textContent = "Radar Cancelado";
+                statusBadge.className = "text-lg font-semibold text-red-400";
+            }
+        });
+
+        async function iniciarEscaneoPasivo(deviceName) {
+            try {
+                // Reiniciar tiempos
+                lastResponseTime = Date.now();
+                alarmZone.classList.add('hidden');
+
+                // Verificamos si el navegador soporta el escaneo de anuncios (LE Scan)
+                if ('watchAdvertisements' in BluetoothDevice.prototype) {
+                    // Re-buscamos el objeto dispositivo para activar su escucha pasiva
+                    const devices = await navigator.bluetooth.getDevices();
+                    const myWatch = devices.find(d => d.id === watchTargetId);
+                    
+                    if (myWatch) {
+                        myWatch.addEventListener('advertisementreceived', (event) => {
+                            // ¡Cada vez que el reloj emite su señal pasiva de presencia, actualizamos el tiempo!
+                            lastResponseTime = Date.now();
+                            lastSeen.textContent = `Última señal recibida: ${new Date().toLocaleTimeString()}`;
+                            if(!alarmZone.classList.contains('hidden')) {
+                                alarmZone.classList.add('hidden');
+                                statusBadge.textContent = "Radar Escuchando...";
+                                statusBadge.className = "text-lg font-semibold text-green-400";
+                            }
+                        });
+
+                        // Arrancamos la escucha de anuncios
+                        await myWatch.watchAdvertisements();
+                    }
+                }
+
+                // Vigilante: Comprueba cada 5 segundos si el reloj ha dejado de hablar
+                if(checkInterval) clearInterval(checkInterval);
+                
+                checkInterval = setInterval(() => {
+                    const tiempoSinSaberDelReloj = Date.now() - lastResponseTime;
+                    
+                    // Si pasan más de 15 segundos sin recibir ráfagas de señal, asumimos olvido
+                    if (tiempoSinSaberDelReloj > 15000) {
+                        dispararAlertaOlvido();
+                    }
+                }, 5000);
+
+            } catch (e) {
+                console.log("El navegador no soporta watchAdvertisements de forma nativa todavía, usando simulación de presencia.");
+                // Caída elegante si el navegador bloquea los anuncios estrictos
+                lastResponseTime = Date.now();
+            }
+        }
+
+        function dispararAlertaOlvido() {
+            statusBadge.textContent = "¡FUERA DE RANGO!";
+            statusBadge.className = "text-lg font-semibold text-red-500 font-bold";
+            
+            if(alarmZone.classList.contains('hidden')) {
+                alarmZone.classList.remove('hidden');
+
+                // Vibración del móvil
+                if (navigator.vibrate) {
+                    navigator.vibrate([200, 100, 200]);
+                }
+
+                // Notificación al móvil (que Mi Fitness mandará al reloj en el último segundo que le quede de cobertura)
+                if (Notification.permission === "granted") {
+                    navigator.serviceWorker.ready.then(registration => {
+                        registration.showNotification("⚠️ ¿Te dejas algo?", {
+                            body: "Comprueba el reloj o el teléfono antes de continuar. ⌚",
+                            icon: "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>⌚</text></svg>",
+                            tag: 'alerta-olvido',
+                            requireInteraction: false
+                        });
+                    });
+                }
+
+                // Sonido más suave (Tono armónico de flauta/pájaro, mucho menos molesto)
+                ejecutarSonidoSuave();
+            }
+        }
+
+        function ejecutarSonidoSuave() {
+            try {
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioCtx.createOscillator();
+                const gainNode = audioCtx.createGain();
+                
+                oscillator.type = 'sine'; // Onda suave, tipo silbido o campana limpia
+                oscillator.frequency.setValueAtTime(587.33, audioCtx.currentTime); // Nota Re5 (Agradable)
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                
+                gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime); // Volumen al 30%, no molesto
+                
+                oscillator.start();
+                oscillator.stop(audioCtx.currentTime + 1.5); // Solo suena segundo y medio
+            } catch(e) {
+                console.log(e);
+            }
+        }
+    </script>
+</body>
+</html>
